@@ -34,10 +34,19 @@ CREATE TABLE IF NOT EXISTS events (
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
-    """Open the application database with consistent connection settings."""
+    """Open the application database with consistent connection settings, WAL mode, and timeouts."""
     database_path = path or config.DB_PATH
-    connection = sqlite3.connect(database_path, check_same_thread=False)
+    # ADDED: timeout=30.0 to prevent "database is locked" errors on Windows
+    connection = sqlite3.connect(database_path, check_same_thread=False, timeout=30.0)
     connection.row_factory = sqlite3.Row
+    
+    # ADDED: Enable Write-Ahead Logging and 30-second busy timeout for high concurrency
+    try:
+        connection.execute("PRAGMA journal_mode=WAL;")
+        connection.execute("PRAGMA busy_timeout=30000;")
+    except sqlite3.OperationalError:
+        pass
+        
     return connection
 
 
@@ -77,21 +86,23 @@ def init_db(path: str | None = None) -> sqlite3.Connection:
     database_path = Path(path or config.DB_PATH)
     database_path.parent.mkdir(parents=True, exist_ok=True)
     connection = connect(str(database_path))
-    connection.execute(_EVENTS_SCHEMA)
-    _ensure_events_columns(connection)
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_events_action ON events(action)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)")
-    connection.execute("CREATE INDEX IF NOT EXISTS idx_events_file_path ON events(file_path)")
-    connection.execute(
-        "CREATE TABLE IF NOT EXISTS schema_meta "
-        "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
-    )
-    connection.execute(
-        "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
-        "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-        (str(SCHEMA_VERSION),),
-    )
-    connection.commit()
+    
+    # Lock the database briefly to ensure serial table creation
+    with connection:
+        connection.execute(_EVENTS_SCHEMA)
+        _ensure_events_columns(connection)
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_events_action ON events(action)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)")
+        connection.execute("CREATE INDEX IF NOT EXISTS idx_events_file_path ON events(file_path)")
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS schema_meta "
+            "(key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO schema_meta(key, value) VALUES('schema_version', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (str(SCHEMA_VERSION),),
+        )
     return connection
 
 
@@ -124,23 +135,23 @@ def write_pipeline_heartbeat(connection: sqlite3.Connection, *,
     import json
     import time
 
-    connection.execute(_PIPELINE_STATUS_SCHEMA)
-    connection.execute(
-        """
-        INSERT INTO pipeline_status
-            (id, heartbeat, started_at, pid, watch_folders, dry_run,
-             engine, stats)
-        VALUES (1, ?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(id) DO UPDATE SET
-            heartbeat=excluded.heartbeat, started_at=excluded.started_at,
-            pid=excluded.pid, watch_folders=excluded.watch_folders,
-            dry_run=excluded.dry_run, engine=excluded.engine,
-            stats=excluded.stats
-        """,
-        (time.time(), started_at, pid, json.dumps(list(watch_folders)),
-         1 if dry_run else 0, engine, json.dumps(stats or {})),
-    )
-    connection.commit()
+    with connection:
+        connection.execute(_PIPELINE_STATUS_SCHEMA)
+        connection.execute(
+            """
+            INSERT INTO pipeline_status
+                (id, heartbeat, started_at, pid, watch_folders, dry_run,
+                 engine, stats)
+            VALUES (1, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET
+                heartbeat=excluded.heartbeat, started_at=excluded.started_at,
+                pid=excluded.pid, watch_folders=excluded.watch_folders,
+                dry_run=excluded.dry_run, engine=excluded.engine,
+                stats=excluded.stats
+            """,
+            (time.time(), started_at, pid, json.dumps(list(watch_folders)),
+             1 if dry_run else 0, engine, json.dumps(stats or {})),
+        )
 
 
 def read_pipeline_heartbeat(connection: sqlite3.Connection) -> dict | None:

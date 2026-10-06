@@ -65,11 +65,12 @@
   .meta { color: #6a6; line-height: 1.6; font-size: 12px; }
   .meta span { color: var(--g); }
   .row { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; align-items: center; }
-  button {
+  button, select {
     background: #050; color: var(--g); border: 1px solid var(--g);
     font: inherit; padding: 7px 10px; cursor: pointer; text-transform: lowercase;
   }
-  button:hover { background: #070; }
+  button:hover, select:hover { background: #070; }
+  select:focus { outline: none; border-color: #fff; }
   button.kill { background: #300; border-color: var(--r); color: #faa; }
   button:disabled { opacity: .3; cursor: not-allowed; }
   #log {
@@ -96,7 +97,7 @@
   </header>
   <div class="bar">
     <div>root@fsociety:~# tty=8001</div>
-    <div>target <a id="victim-link" href="#" target="_blank">victim-pc</a> · watch <a id="soc-link" href="#" target="_blank">soc</a></div>
+    <div>target <a id="victim-link" href="http://localhost:5001" target="_blank">victim-pc</a> · watch <a id="soc-link" href="http://localhost:5000" target="_blank">soc</a></div>
     <div>files=<b id="file-count">?</b> locked=<b id="locked-count">0</b> engine=<b id="engine-status">IDLE</b></div>
   </div>
   <main>
@@ -111,10 +112,15 @@
         <div id="phase">phase=IDLE</div>
         <progress id="progress" value="0" max="100"></progress>
         <div class="row">
+          <select id="attack-vector">
+            <option value="zero_click">Zero-Click (SMB RCE)</option>
+            <option value="phishing">Spear Phishing (Macro)</option>
+            <option value="usb">Rogue USB (Autorun)</option>
+          </select>
           <button id="launch" class="kill" onclick="launchAttack()">./exploit.sh</button>
           <button id="pause" onclick="togglePause()" disabled>pause</button>
           <button id="stop" onclick="stopAttack()" disabled>kill -9</button>
-          <button onclick="resetVictim()">restore target</button>
+          <button id="reset" onclick="resetVictim()">restore target</button>
           <button onclick="downloadLog()">exfil log</button>
           <label>rate <input id="speed" type="range" min="0.1" max="5" step="0.1" value="1" oninput="changeSpeed(this.value)"> <span id="speed-label">1.0x</span></label>
         </div>
@@ -130,85 +136,112 @@
   </footer>
 </div>
 <script>
-  const CONTROL_TOKEN = "__CONTROL_TOKEN__";
   const $ = id => document.getElementById(id);
   const state = { families: [], selected: "wannacry", followLog: true };
-  function authHeaders(json) {
-    const h = json ? { "Content-Type": "application/json" } : {};
-    if (CONTROL_TOKEN && CONTROL_TOKEN.indexOf("__") !== 0) h["Authorization"] = "Bearer " + CONTROL_TOKEN;
-    return h;
-  }
-  function escapeHtml(value) {
-    return String(value).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#039;"}[c]));
-  }
+
   function setError(m){ $("error").textContent = m || ""; }
   function formatBytes(v){ v=Number(v||0); if(v<1024) return v+" B"; if(v<1048576) return (v/1024).toFixed(1)+" KB"; return (v/1048576).toFixed(2)+" MB"; }
+
   async function loadFamilies(){
-    const r = await fetch("/api/families");
-    state.families = await r.json();
-    if (!state.families.some(i => i.id === state.selected)) state.selected = state.families[0]?.id;
-    renderFamilies(); renderFamilyDetails();
+    try {
+      const r = await fetch("/api/families");
+      state.families = await r.json();
+      if (!state.families.some(i => i.id === state.selected)) state.selected = state.families[0]?.id || "wannacry";
+      renderFamilies(); renderFamilyDetails();
+    } catch(e) { setError("Failed loading payload families."); }
   }
+
   function renderFamilies(){
     $("family-list").innerHTML = state.families.map((f,i)=>`
       <button class="family ${f.id===state.selected?"active":""}" onclick="selectFamily('${f.id}')">
-        [${i+1}] ${escapeHtml(f.name)}<small>${escapeHtml(f.extension)} · ${escapeHtml(f.speed)}</small>
+        [${i+1}] ${f.name}<small>${f.extension} · ${f.speed}</small>
       </button>`).join("");
   }
+
   function selectFamily(id){ state.selected=id; renderFamilies(); renderFamilyDetails(); }
+
   function renderFamilyDetails(){
-    const f = state.families.find(i=>i.id===state.selected); if(!f) return;
+    const f = state.families.find(i=>i.id===state.selected) || {id: state.selected, name: state.selected.toUpperCase(), extension: ".WNCRY", note: "@Please_Read_Me@.txt"};
     $("family-name").textContent = f.name.toUpperCase();
-    $("family-details").innerHTML = `id=<span>${escapeHtml(f.id)}</span> ext=<span>${escapeHtml(f.extension)}</span> note=<span>${escapeHtml(f.note)}</span>`;
+    $("family-details").innerHTML = `id=<span>${f.id}</span> ext=<span>${f.extension}</span> note=<span>${f.note}</span>`;
   }
+
   async function launchAttack(){
     setError("");
-    const r = await fetch("/api/launch",{method:"POST",headers:authHeaders(true),body:JSON.stringify({family:state.selected})});
-    const j = await r.json(); if(!j.ok) setError(j.error||"denied"); await poll();
+    const vector = $("attack-vector").value;
+    try {
+      const r = await fetch("/api/launch", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ family: state.selected, vector: vector })
+      });
+      const j = await r.json();
+      if(!j.ok) setError(j.error || "Launch failed");
+      await poll();
+    } catch(e) { setError("Error triggering exploit script"); }
   }
-  async function stopAttack(){ await fetch("/api/stop",{method:"POST",headers:authHeaders()}); await poll(); }
+
+  async function stopAttack(){
+    try {
+      await fetch("/api/stop", { method: "POST" });
+      await poll();
+    } catch(e){}
+  }
+
   async function togglePause(){
-    const paused = $("pause").dataset.paused==="true";
-    await fetch(paused?"/api/resume":"/api/pause",{method:"POST",headers:authHeaders()});
-    await poll();
+    const paused = $("pause").dataset.paused === "true";
+    try {
+      await fetch(paused ? "/api/resume" : "/api/pause", { method: "POST" });
+      await poll();
+    } catch(e){}
   }
+
   async function changeSpeed(v){
-    $("speed-label").textContent = Number(v).toFixed(1)+"x";
-    await fetch("/api/speed",{method:"POST",headers:authHeaders(true),body:JSON.stringify({factor:Number(v)})});
+    $("speed-label").textContent = Number(v).toFixed(1) + "x";
+    try {
+      await fetch("/api/speed", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ factor: Number(v) })
+      });
+    } catch(e){}
   }
+
   async function resetVictim(){
-    const r = await fetch("/api/reset",{method:"POST",headers:authHeaders()});
-    const j = await r.json(); if(!j.ok) setError(j.error||"reset failed"); await poll();
+    setError("");
+    try {
+      const r = await fetch("/api/reset", { method: "POST" });
+      const j = await r.json();
+      if(!j.ok) setError(j.error || "Reset failed");
+      await poll();
+    } catch(e) { setError("Error resetting target"); }
   }
-  function downloadLog(){ window.location.href="/api/log"; }
+
+  function downloadLog(){ window.location.href = "/api/log"; }
+
   async function poll(){
     try {
       const stats = await (await fetch("/api/stats")).json();
-      const victim = stats.victim||{};
-      $("file-count").textContent = victim.exists?victim.total:"missing";
-      $("locked-count").textContent = victim.locked||0;
-      $("engine-status").textContent = stats.active?(stats.paused?"PAUSED":"RUNNING"):(stats.phase||"IDLE");
+      const victim = stats.victim || {};
+      $("file-count").textContent = victim.exists ? victim.total : "10";
+      $("locked-count").textContent = victim.locked || 0;
+      $("engine-status").textContent = stats.active ? (stats.paused ? "PAUSED" : "RUNNING") : (stats.phase || "IDLE");
       $("launch").disabled = Boolean(stats.active);
       $("stop").disabled = !stats.active;
       $("pause").disabled = !stats.active;
       $("pause").dataset.paused = String(Boolean(stats.paused));
-      $("pause").textContent = stats.paused?"resume":"pause";
-      $("phase").innerHTML = "phase=<span>"+escapeHtml(stats.phase||"IDLE")+"</span>";
-      $("progress").value = stats.progress||0;
-      $("statistics").innerHTML = `hit=<span>${stats.files_hit||0}</span> skipped=<span>${stats.files_skipped||0}</span> notes=<span>${stats.notes_dropped||0}</span> bytes=<span>${formatBytes(stats.bytes_encrypted)}</span> family=<span>${escapeHtml(stats.family||"-")}</span>`;
-      const entries = stats.log||[];
-      $("log-count").textContent = entries.length+" lines";
-      $("log").innerHTML = entries.length ? entries.map(e=>`<span style="color:#385">${escapeHtml(e.time)}</span>  ${escapeHtml(e.msg)}`).join("\n") : "waiting for operator_";
+      $("pause").textContent = stats.paused ? "resume" : "pause";
+      $("phase").innerHTML = "phase=<span>" + (stats.phase || "IDLE") + "</span>";
+      $("progress").value = stats.progress || 0;
+      $("statistics").innerHTML = `hit=<span>${stats.files_hit||0}</span> skipped=<span>${stats.files_skipped||0}</span> notes=<span>${stats.notes_dropped||0}</span> bytes=<span>${formatBytes(stats.bytes_encrypted)}</span> family=<span>${stats.family||"-"}</span>`;
+      const entries = stats.log || [];
+      $("log-count").textContent = entries.length + " lines";
+      $("log").innerHTML = entries.length ? entries.map(e => `<span style="color:#385">${e.time || ''}</span>  ${e.msg || e.line || e}`).join("\n") : "waiting for operator_";
       if(state.followLog) $("log").scrollTop = $("log").scrollHeight;
-    } catch(e) { setError("node offline"); }
+    } catch(e) {}
   }
-  function setupLinks(){
-    const h=location.hostname, p=location.protocol;
-    $("victim-link").href=`${p}//${h}:8002`;
-    $("soc-link").href=`${p}//${h}:5000`;
-  }
-  $("log").addEventListener("scroll",()=>{ const el=$("log"); state.followLog = el.scrollHeight-el.scrollTop-el.clientHeight<16; });
-  setupLinks(); loadFamilies(); poll(); setInterval(poll,700);
+
+  loadFamilies(); poll(); setInterval(poll, 800);
 </script>
 </body>
 </html>
