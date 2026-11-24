@@ -51,6 +51,39 @@ QUARANTINE_FILES = getattr(
 )
 SOC_URL = getattr(config, "SOC_URL", "http://127.0.0.1:5000")
 
+# ── Victim registered contact ──────────────────────────────
+# The address incident notifications are sent to. The victim-side
+# application is the source of truth: it can be viewed and changed in
+# the UI, and the notification layer reads the same shared file.
+VICTIM_PROFILE_PATH = getattr(
+    config, "VICTIM_PROFILE_PATH", os.path.join(BASE_DIR, "victim_profile.json"))
+_DEFAULT_VICTIM_EMAIL = getattr(
+    config, "VICTIM_EMAIL", "employee@victim-pc.corp")
+
+
+def _load_victim_profile() -> dict:
+    try:
+        with open(VICTIM_PROFILE_PATH, encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    email = data.get("email") or _DEFAULT_VICTIM_EMAIL
+    name = data.get("name") or "Victim User"
+    return {"name": str(name), "email": str(email)}
+
+
+def _save_victim_profile(profile: dict) -> None:
+    try:
+        with open(VICTIM_PROFILE_PATH, "w", encoding="utf-8") as handle:
+            json.dump(profile, handle, indent=2)
+    except OSError:
+        pass
+
+
+VICTIM_PROFILE = _load_victim_profile()
+
 os.makedirs(USER_FILES, exist_ok=True)
 os.makedirs(QUARANTINE_FILES, exist_ok=True)
 
@@ -232,6 +265,26 @@ def vault_login():
 def vault_logout():
     session.clear()
     return jsonify({"ok": True, "message": "Privileged session closed"})
+
+
+@app.route("/api/profile")
+def victim_profile():
+    """The victim's registered contact (target for incident alerts)."""
+    return jsonify(VICTIM_PROFILE)
+
+
+@app.route("/api/profile", methods=["POST"])
+def update_victim_profile():
+    """Register or update the victim's email for incident notifications."""
+    global VICTIM_PROFILE
+    data = request.get_json(silent=True) or {}
+    email = str(data.get("email") or "").strip()
+    if not email or "@" not in email or "." not in email.split("@")[-1]:
+        return jsonify({"error": "a valid email address is required"}), 400
+    name = str(data.get("name") or "").strip() or "Victim User"
+    VICTIM_PROFILE = {"name": name, "email": email}
+    _save_victim_profile(VICTIM_PROFILE)
+    return jsonify(VICTIM_PROFILE)
 
 
 @app.route("/api/folders")

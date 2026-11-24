@@ -7,7 +7,7 @@ from pathlib import Path
 
 import config
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 _EVENTS_SCHEMA = """
 CREATE TABLE IF NOT EXISTS events (
@@ -31,6 +31,28 @@ CREATE TABLE IF NOT EXISTS events (
     q_values      TEXT
 )
 """
+
+# One row per email notification attempt. The UNIQUE constraint on
+# (incident_id, stage) is the dedup guarantee: a detection alert and a
+# recovery alert can each be sent at most once per incident, even if the
+# pipeline re-processes the same campaign or restarts mid-incident.
+_NOTIFICATIONS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS notifications (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_id  TEXT NOT NULL,
+    stage        TEXT NOT NULL,
+    recipient    TEXT NOT NULL,
+    subject      TEXT NOT NULL,
+    status       TEXT NOT NULL,
+    detail       TEXT,
+    sent_at      TEXT
+)
+"""
+
+_NOTIFICATIONS_UNIQUE = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_notifications_incident_stage "
+    "ON notifications(incident_id, stage)"
+)
 
 
 def connect(path: str | None = None) -> sqlite3.Connection:
@@ -91,6 +113,8 @@ def init_db(path: str | None = None) -> sqlite3.Connection:
     with connection:
         connection.execute(_EVENTS_SCHEMA)
         _ensure_events_columns(connection)
+        connection.execute(_NOTIFICATIONS_SCHEMA)
+        connection.execute(_NOTIFICATIONS_UNIQUE)
         connection.execute("CREATE INDEX IF NOT EXISTS idx_events_action ON events(action)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp)")
         connection.execute("CREATE INDEX IF NOT EXISTS idx_events_file_path ON events(file_path)")
@@ -169,3 +193,42 @@ def read_pipeline_heartbeat(connection: sqlite3.Connection) -> dict | None:
     data["stats"] = json.loads(data.get("stats") or "{}")
     data["dry_run"] = bool(data.get("dry_run"))
     return data
+
+
+# ── Incident email notifications ────────────────────────────
+# The notifications table (created in init_db) records one row per
+# alert attempt. The (incident_id, stage) unique index is the dedup
+# guarantee used by the notification layer.
+
+
+def notification_sent(connection: sqlite3.Connection,
+                      incident_id: str, stage: str) -> bool:
+    """True if an alert for *incident_id* at *stage* was already attempted."""
+    row = connection.execute(
+        "SELECT 1 FROM notifications WHERE incident_id = ? AND stage = ? "
+        "LIMIT 1",
+        (incident_id, stage),
+    ).fetchone()
+    return row is not None
+
+
+def record_notification(connection: sqlite3.Connection, *,
+                        incident_id: str, stage: str, recipient: str,
+                        subject: str, status: str,
+                        detail: str | None = None) -> bool:
+    """Record one notification attempt.
+
+    Returns True when the row was inserted, False when an attempt for the
+    same (incident_id, stage) already exists (the duplicate was ignored).
+    """
+    try:
+        cursor = connection.execute(
+            "INSERT OR IGNORE INTO notifications "
+            "(incident_id, stage, recipient, subject, status, detail, sent_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, datetime('now'))",
+            (incident_id, stage, recipient, subject, status, detail),
+        )
+        connection.commit()
+        return cursor.rowcount > 0
+    except sqlite3.Error:
+        return False

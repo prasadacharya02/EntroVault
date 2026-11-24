@@ -78,6 +78,35 @@ SOC Dashboard (socket.io real-time push 0.4s) + Victim Explorer (neutral)
 - **Vault PIN** - `victim_user / 1234`, 8h session, quarantine_only scope, cannot decrypt (ransomware destroyed original)
 - **Blockchain audit** - Ganache smart contract with local SQLite fallback (works without Ganache), clearly labeled mode
 
+## 📧 Automated Victim Email Notifications
+
+When the pipeline confirms an incident it opens one **incident**, tracks every
+affected file and its recovery outcome, and emails the victim **twice**:
+
+1. **Detection** — sent as recovery begins (subject:
+   `EntroVault Security Alert – File Recovery in Progress`).
+2. **Recovery complete** — sent after quarantine, sweep and post-kill
+   verification finish (subject: `EntroVault Security Alert – File Recovery Complete`).
+
+The sender is a dedicated project account displayed as **EntroVault Security
+System**. Bodies are generated from live incident data (affected count,
+unaffected count, recovery status) — never hardcoded. If any file could not be
+restored, the completion mail says so instead of claiming success.
+
+- Sending uses Python's standard SMTP client against Gmail
+  (`smtp.gmail.com:587` + STARTTLS).
+- Configure the sender and the victim's address in `.env` (see `.env.example`):
+  `ENTROPY_EMAIL_ADDRESS`, `ENTROPY_EMAIL_PASSWORD` (a Gmail **App Password**),
+  `ENTROPY_EMAIL_ENABLED`, `ENTROPY_VICTIM_EMAIL`.
+- The victim's address is also configurable **from the victim-side app**
+  (`GET/POST /api/profile`), and the notifier reads the same shared profile.
+- **No duplicates:** every attempt is recorded in the SQLite `notifications`
+  table with a unique `(incident_id, stage)` index — one detection and one
+  completion per incident, even across restarts.
+- **Never breaks the pipeline:** a missing account, an SMTP error or a storage
+  problem is logged and reported, never raised. `ENTROPY_EMAIL_SEND_DRY_RUN=true`
+  simulates delivery for offline demos/tests without contacting a mail server.
+
 ## 📊 Measured Performance (Honest, Regeneratable)
 
 ```bash

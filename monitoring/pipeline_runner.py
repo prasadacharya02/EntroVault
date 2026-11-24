@@ -586,11 +586,29 @@ class CampaignTracker:
         # moves, and without this every later campaign event re-swept
         # every earlier file (hundreds of duplicate SOC rows per attack).
         self.swept: dict = {}
+        # One incident identity per burst of encrypted-data signatures.
+        # Persists across the whole burst (a gap of CAMPAIGN_WINDOW_SECONDS
+        # without a qualifying file ends it) so every file of a campaign
+        # maps to ONE incident and produces one alert set.
+        self.campaign_token: str | None = None
+        self._last_qualify_at: float = 0.0
 
     def reset(self):
         self.entries.clear()
         self.last_verified = None
         self.swept.clear()
+        self.campaign_token = None
+        self._last_qualify_at = 0.0
+
+    @property
+    def campaign_id(self) -> str | None:
+        """Stable identity for the current campaign burst.
+
+        All files of one burst share this id, so the notification layer
+        groups them into a single incident (one alert set, not one per
+        file). Returns None before the burst begins.
+        """
+        return self.campaign_token
 
     @staticmethod
     def _qualifies(event: dict) -> bool:
@@ -637,7 +655,17 @@ class CampaignTracker:
         if verified is not None:
             self.last_verified = (now, verified)
 
-        if not self._qualifies(event):
+        qualifies = self._qualifies(event)
+        if qualifies:
+            # Assign (or keep) the campaign-burst identity. A gap of
+            # CAMPAIGN_WINDOW_SECONDS without a qualifying file ends the
+            # burst and starts a new campaign.
+            if (self.campaign_token is None
+                    or now - self._last_qualify_at > window):
+                self.campaign_token = f"campaign-{int(now)}"
+            self._last_qualify_at = now
+
+        if not qualifies:
             return False, [], None
 
         path = os.path.normpath(event.get("file_path") or "")
@@ -780,6 +808,12 @@ class DecisionEngine:
         escalate, sweep, kill_override = (
             self.campaign_tracker.check_and_record(event, action)
         )
+        # Attach the campaign-burst identity to every event so the
+        # notification layer groups all files of one burst into one
+        # incident — even when this event was not the escalation trigger.
+        campaign_id = self.campaign_tracker.campaign_id
+        if campaign_id:
+            decision["campaign_id"] = campaign_id
         if not escalate:
             return decision
 
@@ -935,6 +969,25 @@ class PipelineRunner:
         # Backup & recovery store
         self.backup = BackupManager()
 
+        # Incident notification subsystem. Defensive: if it cannot be
+        # constructed (or is disabled) the detection pipeline keeps
+        # running exactly as before and simply emits no email alerts.
+        self.notifier = None
+        self.incidents = None
+        try:
+            from notification.email_notifier import EmailNotifier
+            from notification.incidents import IncidentTracker
+            self.notifier = EmailNotifier()
+            self.incidents = IncidentTracker()
+            log.info("[RUNNER] Incident email notifications ready")
+        except Exception as notify_err:
+            self.notifier = None
+            self.incidents = None
+            log.warning(
+                f"[RUNNER] Incident notification subsystem unavailable "
+                f"({notify_err}) — continuing without email alerts"
+            )
+
         # Stats
         self.stats = {
             "total"      : 0,
@@ -1039,6 +1092,17 @@ class PipelineRunner:
                 conn = None
             time.sleep(interval)
 
+    def _notify_incident(self, incident, stage: str) -> None:
+        """Best-effort notification dispatch; never breaks the pipeline."""
+        if self.notifier is None or incident is None:
+            return
+        try:
+            self.notifier.notify(incident, stage)
+        except Exception as notify_err:
+            log.warning(
+                f"[RUNNER] Incident {stage} notification failed: "
+                f"{notify_err}")
+
     def _on_analyzed_event(self, event: dict):
         """
         Called by the pipeline for every analyzed event.
@@ -1125,10 +1189,35 @@ class PipelineRunner:
                     f"PID:{decision['kill_override'].get('pid')} "
                     f"({decision['kill_override'].get('name')})")
 
+        # ── Incident lifecycle & victim notification ───────
+        # A confirmed containment opens ONE incident for the encryption
+        # burst. The victim is alerted that recovery is in progress
+        # BEFORE any file is restored, and a completion alert is sent
+        # once recovery finishes. The incident is keyed by the campaign
+        # token so every file of the same burst maps to the same incident
+        # (one alert set, no duplicates). Events with no encryption
+        # signature (e.g. a lone ransom note) do not open a recovery
+        # incident — they carry no file to recover.
+        incident = None
+        if (action == config.ACTION_TERMINATE_QUARANTINE
+                and decision.get("campaign_id")
+                and self.incidents is not None):
+            incident = self.incidents.begin(event, decision)
+            for sweep_event in (decision.get("sweep_events") or []):
+                sweep_path = sweep_event.get("file_path")
+                if sweep_path:
+                    incident.add_affected(sweep_path, outcome="pending_sweep")
+            incident.mark_recovery_started()
+            self._notify_incident(incident, "detected")
+
         # ── Execute response ───────────────────────
         status = execute_response(
             action, event, self.bc, self.db, decision, backup=self.backup
         )
+
+        # Record this file's recovery outcome for the notification summary.
+        if incident is not None:
+            incident.record_outcome(file_path, status)
 
         # ── Campaign sweep ───────────────────────────
         # Quarantine + restore the remaining campaign files the
@@ -1152,6 +1241,8 @@ class PipelineRunner:
                 log.warning(
                     f"  [SWEEP] {os.path.basename(se.get('file_path',''))} "
                     f"→ {sweep_status}")
+                if incident is not None:
+                    incident.record_outcome(se.get("file_path"), sweep_status)
             except Exception as e:
                 log.error(f"  [SWEEP] Failed for "
                           f"{se.get('file_path')}: {e}")
@@ -1172,7 +1263,14 @@ class PipelineRunner:
             if (not config.DRY_RUN
                     or now - last > config.CAMPAIGN_WINDOW_SECONDS):
                 self._last_postkill = now
-                self._post_kill_verification()
+                self._post_kill_verification(incident)
+
+        # ── Recovery completion notification ───────────
+        # Sent once the incident is fully contained and the post-kill
+        # verification pass has repaired anything the sweep missed.
+        if incident is not None:
+            incident.mark_recovery_complete()
+            self._notify_incident(incident, "completed")
 
         # ── Mirror the rename-back in the entropy history ──
         # execute_response may have moved a renamed file back to its
@@ -1223,7 +1321,7 @@ class PipelineRunner:
             return "restore in progress"
         return None
 
-    def _post_kill_verification(self):
+    def _post_kill_verification(self, incident=None):
         """Walk the protected estate once after a confirmed campaign kill.
 
         A process can die mid-write on a file that has not produced its
@@ -1321,6 +1419,8 @@ class PipelineRunner:
                                 pass
                         self.stats["quarantined"] += 1
                         log.warning(f"  [SWEEP] {name} → {sweep_status}")
+                        if incident is not None:
+                            incident.record_outcome(path, sweep_status)
                     except Exception as e:
                         log.error(f"  [SWEEP] Failed for {path}: {e}")
         log.warning(

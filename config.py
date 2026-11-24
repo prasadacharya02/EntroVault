@@ -148,6 +148,32 @@ EXCHANGE_NODE_ID           = os.getenv("ENTROPY_NODE_ID", "").strip()
 EXCHANGE_CONFIRM_THRESHOLD = _env_int("ENTROPY_EXCHANGE_CONFIRM_THRESHOLD", 2, minimum=2)
 EXCHANGE_ENABLED           = _env_bool("ENTROPY_EXCHANGE", True)
 
+# ── Incident Email Notifications ───────────────────────────
+# Automatic email alerts to the victim when EntroVault detects an
+# incident and again when recovery finishes. Sending uses Python's
+# standard SMTP client against Gmail; a dedicated project account is
+# the sender ("EntroVault Security System").
+EMAIL_ENABLED         = _env_bool("ENTROPY_EMAIL_ENABLED", True)
+EMAIL_SMTP_HOST       = os.getenv("ENTROPY_SMTP_HOST", "smtp.gmail.com").strip()
+EMAIL_SMTP_PORT       = _env_int("ENTROPY_SMTP_PORT", 587, minimum=1)
+EMAIL_USE_TLS         = _env_bool("ENTROPY_EMAIL_USE_TLS", True)
+EMAIL_SENDER_ADDRESS  = os.getenv("ENTROPY_EMAIL_ADDRESS", "").strip()
+EMAIL_SENDER_PASSWORD = os.getenv("ENTROPY_EMAIL_PASSWORD", "").strip()
+EMAIL_SENDER_NAME     = os.getenv(
+    "ENTROPY_EMAIL_SENDER_NAME", "EntroVault Security System"
+).strip()
+EMAIL_SEND_TIMEOUT    = _env_float("ENTROPY_EMAIL_SEND_TIMEOUT", 15.0, minimum=1.0)
+# Simulate the SMTP exchange without contacting a mail server. Used by
+# tests and the offline demo when real Gmail credentials are absent.
+EMAIL_SEND_DRY_RUN    = _env_bool("ENTROPY_EMAIL_SEND_DRY_RUN", False)
+
+# ── Victim Registered Contact ──────────────────────────────
+# The victim's registered email. The victim-side application exposes
+# and edits this address; notifications resolve it from the shared
+# profile file so a change made in the victim UI takes effect.
+VICTIM_EMAIL          = os.getenv("ENTROPY_VICTIM_EMAIL", "employee@victim-pc.corp").strip()
+VICTIM_PROFILE_PATH   = str((BASE_PATH / "victim_server" / "victim_profile.json").resolve())
+
 DASHBOARD_HOST      = os.getenv("ENTROPY_DASHBOARD_HOST", "127.0.0.1")
 DASHBOARD_PORT      = _env_int("ENTROPY_DASHBOARD_PORT", 5000, minimum=1)
 FLASK_HOST          = DASHBOARD_HOST
